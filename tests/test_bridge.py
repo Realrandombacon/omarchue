@@ -185,6 +185,45 @@ class BridgeCliTest(unittest.TestCase):
         proc = self.run_cli("put-group", "1", stdin="not json")
         self.assertEqual(proc.returncode, 4)
 
+    # ---- CLIP v2 dynamic scenes ----------------------------------------
+
+    def v2_scenes(self):
+        proc = self.run_cli("v2-scenes")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)["scenes"]
+
+    def test_v2_scenes_flags_dynamics(self):
+        scenes = {s["id"]: s for s in self.v2_scenes()}
+        self.assertIn("s1", scenes)
+        self.assertTrue(scenes["s1"]["dynamic"])
+        self.assertEqual(scenes["s1"]["v2Id"], "v2-s1")
+        self.assertFalse(scenes["s1"]["playing"])
+        self.assertFalse(scenes["s2"]["dynamic"])
+
+    def test_v2_recall_dynamic_then_stop(self):
+        proc = self.run_cli("v2-recall", "v2-s1", "--action", "dynamic_palette",
+                            "--speed", "0.5")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        scenes = {s["id"]: s for s in self.v2_scenes()}
+        self.assertTrue(scenes["s1"]["playing"])
+        self.assertAlmostEqual(scenes["s1"]["speed"], 0.5)
+        proc = self.run_cli("v2-recall", "v2-s1", "--action", "inactive")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        scenes = {s["id"]: s for s in self.v2_scenes()}
+        self.assertFalse(scenes["s1"]["playing"])
+
+    def test_v2_recall_bad_action(self):
+        proc = self.run_cli("v2-recall", "v2-s1", "--action", "warp")
+        self.assertEqual(proc.returncode, 4)
+
+    def test_v2_recall_unknown_scene(self):
+        proc = self.run_cli("v2-recall", "v2-nope", "--action", "dynamic_palette")
+        self.assertEqual(proc.returncode, 3)
+
+    def test_v2_unauthorized(self):
+        proc = self.run_cli("v2-scenes", creds=False)
+        self.assertEqual(proc.returncode, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

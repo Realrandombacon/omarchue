@@ -208,6 +208,43 @@ def bridge_request(method, path, body=None, creds=None, timeout=REQUEST_TIMEOUT)
     return payload, status
 
 
+def v2_request(method, path, body=None, timeout=REQUEST_TIMEOUT):
+    """TLS-pinned CLIP v2 request; the v1 username doubles as the v2
+    application key. `path` is relative to the /clip/v2 root, e.g.
+    "/resource/scene"."""
+    creds = load_creds()
+    headers = {"hue-application-key": creds["username"]}
+    if TEST_BASE_URL:
+        url = TEST_BASE_URL.rstrip("/") + "/clip/v2" + path
+        status, payload = _http(method, url, body, timeout=timeout,
+                                headers=headers)
+    else:
+        url = "https://{}/clip/v2{}".format(creds["bridgeId"].lower(), path)
+        with _BridgeResolver(creds["bridgeId"], creds["bridgeIp"]):
+            status, payload = _http(method, url, body, timeout=timeout,
+                                    headers=headers, ctx=_tls_context())
+    if status == 401:
+        fail(EX_UNPAIRED, "bridge rejected the application key")
+    return payload, status
+
+
+def v2_error(payload, _status=None):
+    """v2 responses carry errors as payload["errors"] entries; anything
+    else (a v1-style error list, junk, None) is not a valid v2 answer."""
+    if isinstance(payload, dict):
+        errors = payload.get("errors") or []
+        if errors:
+            fail(EX_BAD_RESPONSE, str(errors[0]))
+        return
+    fail(EX_BAD_RESPONSE, "unexpected v2 response")
+
+
+def v2_data(payload, status):
+    """v2_error + unwrap the data array."""
+    v2_error(payload, status)
+    return payload.get("data") if isinstance(payload, dict) else None
+
+
 # ------------------------------------------------------- discovery ------
 
 def discover_bridges():
@@ -704,6 +741,56 @@ def cmd_probe_v2(_args):
     sys.exit(EX_OK)
 
 
+def cmd_v2_scenes(_args):
+    """List scenes with CLIP v2 metadata, keyed back to their v1 ids.
+    `dynamic` marks scenes with a color palette (animated playback), the
+    rest are static. `playing` reflects the bridge's own status so the UI
+    can resync after a shell restart."""
+    data = v2_data(*v2_request("GET", "/resource/scene"))
+    out = []
+    for sc in data or []:
+        if not isinstance(sc, dict) or not sc.get("id_v1"):
+            continue
+        v1id = str(sc["id_v1"]).rsplit("/", 1)[-1]
+        out.append({
+            "id": v1id,
+            "v2Id": sc["id"],
+            "dynamic": bool(sc.get("palette")),
+            "playing": (sc.get("status") or {}).get("active") == "dynamic_palette",
+            "speed": sc.get("speed"),
+        })
+    emit({"ok": True, "scenes": out})
+    sys.exit(EX_OK)
+
+
+def cmd_v2_recall(args):
+    """Recall a scene through CLIP v2: "dynamic_palette" starts animated
+    playback (the Hue app's dynamic scenes), "active" recalls it
+    statically (also stops playback), "inactive" stops playback. Speed
+    0..1 scales the animation rate. Options ride either on
+    argv (--action/--speed) or in an optional --body JSON, which is how the
+    shell's action queue transports every command."""
+    raw = getattr(args, "body", None)
+    body = {}
+    if raw:
+        try:
+            body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise ValueError
+        except ValueError:
+            fail(EX_USAGE, "bad body json")
+    action = body.get("action", args.action)
+    speed = body.get("speed", args.speed)
+    if action not in ("dynamic_palette", "active", "inactive"):
+        fail(EX_USAGE, "action must be dynamic_palette, active or inactive")
+    out = {"recall": {"action": action}}
+    if speed is not None:
+        out["speed"] = round(max(0.0, min(1.0, float(speed))), 3)
+    v2_error(*v2_request("PUT", "/resource/scene/{}".format(args.id), out))
+    emit({"ok": True, "errors": []})
+    sys.exit(EX_OK)
+
+
 def cmd_unpair(_args):
     try:
         STATE_PATH.unlink()
@@ -732,6 +819,12 @@ def main():
     p_light.add_argument("id")
     p_light.add_argument("--body")
     sub.add_parser("probe-v2")
+    sub.add_parser("v2-scenes")
+    p_v2recall = sub.add_parser("v2-recall")
+    p_v2recall.add_argument("id")
+    p_v2recall.add_argument("--action", default="dynamic")
+    p_v2recall.add_argument("--speed")
+    p_v2recall.add_argument("--body")
     sub.add_parser("unpair")
     args = parser.parse_args()
 
@@ -743,6 +836,8 @@ def main():
         "put-group": cmd_put_group,
         "put-light": cmd_put_light,
         "probe-v2": cmd_probe_v2,
+        "v2-scenes": cmd_v2_scenes,
+        "v2-recall": cmd_v2_recall,
         "unpair": cmd_unpair,
     }
     if not args.cmd:

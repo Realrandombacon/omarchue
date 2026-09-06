@@ -32,6 +32,12 @@ Item {
   property bool refreshing: false
   property bool editing: false          // true while the user drags a slider
 
+  // ---- Dynamic scenes (CLIP v2 playback) ---------------------------------
+  // Scenes with a color palette animate ("dynamic" recall in the Hue app).
+  // Keyed by v1 scene id so the existing v1 model needs no rematching.
+  property var dynamicScenes: ({})      // v1Id -> { v2Id, speed }
+  property string playingSceneId: ""    // v1 id of the animating scene
+
   // Defaults from defaults.json in the plugin dir.
   property int pollIntervalSec: 15
   property int ambientPollSec: 30
@@ -117,11 +123,18 @@ Item {
     onTriggered: root.refresh()
   }
 
+  Timer {
+    id: dynResyncTimer
+    interval: 1200
+    onTriggered: root.fetchDynamics()
+  }
+
   property bool panelOpen: false
 
   function setPanelOpen(open) {
     panelOpen = open
     if (open) refresh()
+    if (open) fetchDynamics()
   }
 
   // ---- Polling -----------------------------------------------------------
@@ -249,6 +262,7 @@ Item {
   // group/light merge in place so the bridge sees one request per settle.
   property var _queue: []
   property var _resyncPending: false
+  property string _activeCmd: ""        // cmd of the entry being sent
 
   function sendAction(cmd, id, body, opts) {
     opts = opts || {}
@@ -263,6 +277,7 @@ Item {
       }
     }
     if (!merged) _queue.push({ key: key, cmd: cmd, id: id, body: body })
+    root._activeCmd = cmd
     if (opts.scene) _resyncPending = true
     _queueTimer.interval = debouncedSendMs
     _queueTimer.restart()
@@ -311,6 +326,9 @@ Item {
         // catches up — scene recall especially reshuffles states.
         resyncTimer.restart()
         if (root._resyncPending) { sceneRefetchTimer.restart(); root._resyncPending = false }
+        // Playback state lives on the bridge; give it a beat to settle
+        // before re-reading which scene is animating.
+        if (root._activeCmd === "v2-recall") dynResyncTimer.restart()
       }
       root._drainQueue()
     }
@@ -353,6 +371,57 @@ Item {
       if (!isPaired) isPaired = true
     }
     _startupProbe = false
+  }
+
+  // ---- Dynamic scene discovery --------------------------------------------
+  // One-shot v2-scenes fetch: which scenes animate, and which one (if any)
+  // is playing right now on the bridge — the official app can move that
+  // state behind our back.
+  Process {
+    id: dynProc
+    command: []
+    stdout: StdioCollector {
+      onStreamFinished: root.applyDynamics(text)
+    }
+  }
+
+  property bool _dynResync: false
+
+  function fetchDynamics() {
+    if (!isPaired || dynProc.running) return
+    dynProc.command = helperCmd(["v2-scenes"])
+    dynProc.running = true
+  }
+
+  function applyDynamics(raw) {
+    raw = String(raw || "").trim()
+    if (raw === "") return
+    var snap
+    try { snap = JSON.parse(raw) } catch (e) {
+      console.warn("omarchue: malformed v2-scenes output:", e)
+      return
+    }
+    if (snap.ok !== true || !snap.scenes) return
+    var map = {}
+    for (var i = 0; i < snap.scenes.length; i++) {
+      var s = snap.scenes[i]
+      if (s.dynamic) map[s.id] = { v2Id: s.v2Id, speed: s.speed }
+    }
+    dynamicScenes = map
+    // Resync the playing marker with the bridge unless an action is in
+    // flight (the user just tapped — the optimistic state wins until the
+    // delayed refetch below).
+    if (_dynResync || (!_queue.length && !actionProc.running)) {
+      var found = ""
+      for (var j = 0; j < snap.scenes.length; j++)
+        if (snap.scenes[j].playing) { found = snap.scenes[j].id; break }
+      playingSceneId = found
+      _dynResync = false
+    }
+  }
+
+  function sceneIsDynamic(sceneId) {
+    return dynamicScenes[sceneId] !== undefined
   }
 
   function applySnapshot(raw) {
@@ -466,10 +535,25 @@ Item {
   }
 
   function recallScene(sceneId, groupId) {
-    // Optimistic: apply the scene's own name to the group, then let the
-    // 900ms refetch reconcile colors/brightness.
-    patchGroup(groupId, { on: true })
-    sendAction("put-group", groupId, { scene: sceneId }, { scene: true })
+    var dyn = dynamicScenes[sceneId]
+    if (dyn) {
+      // Dynamic scenes animate: first tap starts playback, tapping the
+      // same scene again stops it. Speeds come from the bridge's own
+      // default (set in the Hue app).
+      var stop = playingSceneId === sceneId
+      sendAction("v2-recall", dyn.v2Id,
+                 { action: stop ? "inactive" : "dynamic_palette" }, { scene: true })
+      playingSceneId = stop ? "" : sceneId
+      _dynResync = true
+      if (!stop && groupId) patchGroup(groupId, { on: true })
+    } else {
+      // Optimistic: apply the scene's own name to the group, then let the
+      // 900ms refetch reconcile colors/brightness. Recalling a static
+      // scene also ends any playback on that group.
+      playingSceneId = ""
+      patchGroup(groupId, { on: true })
+      sendAction("put-group", groupId, { scene: sceneId }, { scene: true })
+    }
     sceneRefetchTimer.restart()
   }
 

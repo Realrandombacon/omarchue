@@ -16,6 +16,15 @@ BarWidget {
   readonly property var hue: root.bar && root.bar.shell
                              ? root.bar.shell.serviceFor(panelId) : null
 
+  // True while at least one room/zone is lit \u2014 drives the amber glyph tint.
+  readonly property bool anyOn: {
+    if (!hue || !hue.isPaired) return false
+    var g = hue.groups
+    for (var i = 0; i < g.length; i++)
+      if (g[i].on) return true
+    return false
+  }
+
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -27,6 +36,11 @@ BarWidget {
     // shell's openPanelIds set, not through this widget).
     active: root.bar && root.bar.shell
             ? root.bar.shell.openPanelIds[root.panelId] === true : false
+    // Amber while any light is on, red while the bridge is unreachable,
+    // default bar color otherwise.
+    foreground: root.hue && root.hue.lastError !== "" ? "#e0654f"
+              : root.anyOn ? "#ffd76e"
+              : Color.foreground
     text: "\uf0eb"   // fa-lightbulb
     tooltipText: {
       if (!root.hue) return "Hue lights"

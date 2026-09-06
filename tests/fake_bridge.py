@@ -15,6 +15,7 @@ STATE = {
     "lights": {},
     "groups": {},
     "scenes": {},
+    "v2scenes": {},
     "config": {"bridgeid": "001788FFFE123456", "name": "Bacon's Bridge",
                "apiversion": "1.62.0"},
     # Bookkeeping for tests: every request the helper made.
@@ -68,7 +69,25 @@ def build_state():
                     [str(i) for i in list(range(32, 41)) + ["41"]]),
     }
     STATE.update({"lights": lights, "groups": groups, "scenes": scenes,
-                  "requests": []})
+                  "v2scenes": {}, "requests": []})
+    # CLIP v2 mirror of the scenes. s1 carries a palette (dynamic-capable);
+    # the others are static. status.active mirrors real bridge values
+    # ("inactive" / "static" / "dynamic").
+    for i, (sid, sc) in enumerate(sorted(scenes.items())):
+        STATE["v2scenes"]["v2-{}".format(sid)] = {
+            "id": "v2-{}".format(sid),
+            "id_v1": "/scenes/{}".format(sid),
+            "type": "scene",
+            "metadata": {"name": sc["name"]},
+            "group": {"rid": "g{}".format(sc["group"]), "rtype": "room"},
+            "palette": {"color": [{"color": {"xy": {"x": 0.5, "y": 0.4}},
+                                   "dimming": {"brightness": 80.0}}]}
+            if sid == "s1" else None,
+            "speed": 0.6031746,
+            "recall": {},
+            "status": {"active": "inactive"},
+            "actions": [],
+        }
     return STATE
 
 
@@ -170,6 +189,11 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/config":
             return self._send(200, STATE["config"])
+        if path == "/clip/v2/resource/scene":
+            if not self._v2_authorized():
+                return self._send(403, {"errors": [{"description":
+                                                    "unauthorized"}]})
+            return self._v2(200, list(STATE["v2scenes"].values()))
         # Any authenticated path under the wrong username is a 401-style
         # v1 error, like the real bridge.
         if path.startswith("/api/") and _USER not in path.split("/"):
@@ -191,6 +215,12 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
             return self._send(200, STATE["scenes"])
         self._send(404, {"error": "not found"})
 
+    def _v2(self, code, data):
+        return self._send(code, {"data": data, "errors": []})
+
+    def _v2_authorized(self):
+        return self.headers.get("hue-application-key") == _USER
+
     def do_PUT(self):
         length = int(self.headers.get("Content-Length") or 0)
         try:
@@ -199,6 +229,25 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "bad json"})
         STATE["requests"].append(("PUT", self.path, body))
         parts = self.path.split("?")[0].strip("/").split("/")
+        # clip/v2/resource/scene/<v2id> — dynamic scene playback control.
+        if len(parts) == 5 and parts[:4] == ["clip", "v2", "resource",
+                                             "scene"] \
+                and parts[4] in STATE["v2scenes"]:
+            if not self._v2_authorized():
+                return self._send(403, {"errors": [{"description":
+                                                    "unauthorized"}]})
+            sc = STATE["v2scenes"][parts[4]]
+            recall = body.get("recall") or {}
+            action = recall.get("action")
+            if action == "dynamic_palette":
+                sc["status"]["active"] = "dynamic_palette"
+            elif action == "active":
+                sc["status"]["active"] = "static"
+            elif action == "inactive":
+                sc["status"]["active"] = "inactive"
+            if "speed" in body:
+                sc["speed"] = body["speed"]
+            return self._v2(200, [{"id": sc["id"], "status": sc["status"]}])
         # api/<user>/groups/<gid>/action | api/<user>/lights/<lid>/state
         if len(parts) == 5 and parts[0] == "api" and parts[1] == _USER:
             if parts[2] == "groups" and parts[4] == "action" \

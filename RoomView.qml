@@ -67,7 +67,7 @@ Column {
   // as soon as any bulb is dragged.
   HuePanelRow {
     width: parent.width
-    visible: root.room && root.room.on && root.room.hasBri
+    visible: root.room && root.room.on && root.room.bri !== null
     label: "Bright"
     hint: "Brightness of every bulb in " + (root.room ? root.room.name : "this room") +
           ". Bulbs that are off stay off."
@@ -99,6 +99,8 @@ Column {
         required property int index
         required property var modelData
         scene: modelData
+        dynamic: root.service && root.service.sceneIsDynamic(modelData.id)
+        playing: root.service && root.service.playingSceneId === modelData.id
         onRecalled: function(scene) {
           if (root.room) root.service.recallScene(scene.id, root.room.id)
         }
