@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.realrandombacon.omarchue",
+  "name": "Omarchue",
+  "version": "0.1.0",
+  "author": "Bacon",
+  "license": "MIT",
+  "repository": "https://github.com/Realrandombacon/omarchue",
+  "description": "Philips Hue control for Omarchy — Android-app-style room tiles, per-light color and brightness, scenes, right in your bar",
+  "kinds": [
+    "service",
+    "panel",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "HueService.qml",
+    "panel": "Panel.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omarchue",
+    "description": "Open the Philips Hue control panel",
+    "category": "Home",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

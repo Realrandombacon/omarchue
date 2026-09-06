@@ -1,0 +1,755 @@
+#!/usr/bin/env python3
+"""Omarchue bridge helper — the only code that talks to the Hue bridge.
+
+One-shot CLI driven by QML through Quickshell's Process. Design rules
+inherited from the two existing Omarchy Hue plugins' hard-won lessons:
+
+- stdout is machine JSON, always; human-readable text goes to stderr only.
+- Exit codes carry the error taxonomy: 0 ok, 1 network, 2 unpaired,
+  3 bad response, 4 usage.
+- The API username never crosses into argv, logs, or the QML process.
+- TLS is pinned to the Signify Hue root CA (hue_bridge_cacert.pem); the
+  bridge's cert SAN names its 16-hex bridge id, not its IP, so we resolve
+  that hostname to the IP ourselves for the duration of each request.
+- HTTP redirects are refused (a compromised bridge must not be able to
+  302 an authenticated URL elsewhere) and response sizes are capped.
+- A network failure never looks like "no lights": bad responses exit
+  non-zero with partial JSON on stdout, and callers keep their last
+  good state.
+"""
+
+import argparse
+import colorsys
+import json
+import math
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+EX_OK = 0
+EX_NETWORK = 1
+EX_UNPAIRED = 2
+EX_BAD_RESPONSE = 3
+EX_USAGE = 4
+
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+PAIR_SECONDS = 90
+PAIR_RETRY_SECS = 2
+REQUEST_TIMEOUT = 6
+
+STATE_PATH = (Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+              / "omarchy" / "settings" / "hue.json")
+CACERT_PATH = Path(__file__).resolve().parent / "hue_bridge_cacert.pem"
+# Test-only override (used by tests/fake_bridge.py); never set by the plugin.
+TEST_BASE_URL = os.environ.get("HUE_BRIDGE_URL")
+
+_USERNAME_RE = re.compile(r"^[0-9A-Za-z-]{20,64}$")
+# Bridge-supplied names end up in QML Text elements (Text.AutoText): strip
+# control, bidi and zero-width characters so a crafted name can't confuse
+# the renderer.
+_SANITIZE_RE = re.compile(r"[\x00-\x1f\x7f​-‏ -‮⁠-⁯﻿]")
+
+
+def sanitize(text):
+    return _SANITIZE_RE.sub("", str(text or "")).strip()
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def fail(code, error, **extra):
+    out = {"ok": False, "code": code, "error": error}
+    out.update(extra)
+    emit(out)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- TLS ----
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _open(req, timeout, ctx=None):
+    """Open a request, always refusing redirects. With a TLS context, build
+    a dedicated opener so the pinned CA is actually used."""
+    if ctx is None:
+        return _OPENER.open(req, timeout=timeout)
+    handler = urllib.request.HTTPSHandler(context=ctx)
+    opener = urllib.request.build_opener(_NoRedirect, handler)
+    return opener.open(req, timeout=timeout)
+
+
+class _BridgeResolver:
+    """Patch getaddrinfo so the bridge-id hostname resolves to the IP.
+
+    The bridge's certificate SAN lists <bridgeid>.local (or the bare
+    16-hex id); connecting by IP would fail hostname verification. For the
+    duration of a request we answer getaddrinfo for that hostname with the
+    known IP, keeping full CA + hostname verification intact.
+    """
+
+    def __init__(self, bridge_id, bridge_ip):
+        self._hostname = bridge_id.lower()
+        self._ip = bridge_ip
+        self._original = None
+
+    def _getaddrinfo(self, host, *args, **kwargs):
+        if isinstance(host, str) and host.lower() == self._hostname:
+            host = self._ip
+        return self._original(host, *args, **kwargs)
+
+    def __enter__(self):
+        self._original = socket.getaddrinfo
+        socket.getaddrinfo = self._getaddrinfo
+        return self
+
+    def __exit__(self, *exc):
+        socket.getaddrinfo = self._original
+        return False
+
+
+def _tls_context(verify_hostname=True):
+    ctx = ssl.create_default_context(cafile=str(CACERT_PATH))
+    if not verify_hostname:
+        # Still CA-pinned (an unrelated certificate is rejected), we just
+        # skip the SAN check — used once during discovery, before we know
+        # the bridge id.
+        ctx.check_hostname = False
+    return ctx
+
+
+def _http(method, url, body=None, timeout=REQUEST_TIMEOUT, ctx=None,
+          headers=None, cap=MAX_RESPONSE_BYTES):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with _open(req, timeout, ctx) as resp:
+            raw = resp.read(cap + 1)
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read().decode())
+        except Exception:
+            payload = None
+        return e.code, payload
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError):
+        fail(EX_NETWORK, "bridge unreachable")
+    if len(raw) > cap:
+        fail(EX_BAD_RESPONSE, "response too large")
+    try:
+        return 200, json.loads(raw.decode())
+    except (ValueError, UnicodeDecodeError):
+        fail(EX_BAD_RESPONSE, "malformed JSON response")
+
+
+# ------------------------------------------------------- credentials ----
+
+def load_creds():
+    try:
+        raw = STATE_PATH.read_text()
+        creds = json.loads(raw)
+    except FileNotFoundError:
+        fail(EX_UNPAIRED, "not paired")
+    except (OSError, ValueError):
+        fail(EX_UNPAIRED, "credential file unreadable")
+    if not creds.get("username") or not creds.get("bridgeId"):
+        fail(EX_UNPAIRED, "credential file incomplete")
+    return creds
+
+
+def save_creds(creds):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(creds, fh)
+        fh.write("\n")
+    os.replace(tmp, STATE_PATH)
+
+
+def bridge_base(creds):
+    """Base URL for authenticated v1 paths (.../api/<username>)."""
+    if TEST_BASE_URL:
+        return TEST_BASE_URL.rstrip("/") + "/api/" + creds["username"]
+    return "https://{}/api/{}".format(creds["bridgeId"].lower(), creds["username"])
+
+
+def bridge_request(method, path, body=None, creds=None, timeout=REQUEST_TIMEOUT):
+    """TLS-pinned request to the bridge. `path` is relative to the v1 user
+    base (.../api/<username>). Returns (payload, http_status)."""
+    creds = creds or load_creds()
+    url = bridge_base(creds) + path
+    if TEST_BASE_URL:
+        status, payload = _http(method, url, body, timeout=timeout)
+    else:
+        with _BridgeResolver(creds["bridgeId"], creds["bridgeIp"]):
+            status, payload = _http(method, url, body, timeout=timeout,
+                                    ctx=_tls_context())
+    if status == 401:
+        fail(EX_UNPAIRED, "bridge rejected the application key")
+    return payload, status
+
+
+# ------------------------------------------------------- discovery ------
+
+def discover_bridges():
+    """mDNS first (gives IP + bridge id in one shot, no rate limit), then
+    the Philips discovery endpoint as fallback (rate-limited per IP)."""
+    bridges = []
+    try:
+        out = subprocess.run(
+            ["timeout", "5", "avahi-browse", "-t", "-r", "_hue._tcp"],
+            capture_output=True, text=True, timeout=8)
+        ip = None
+        bridgeid = None
+        for line in out.stdout.splitlines():
+            m = re.search(r"address = \[([0-9a-fA-F:.]+)\]", line)
+            if m:
+                ip = m.group(1)
+            m = re.search(r"bridgeid=([0-9A-Fa-f]{16})", line)
+            if m:
+                bridgeid = m.group(1).upper()
+            if line.strip().startswith("=") and "IPv" in line:
+                if ip and bridgeid and not any(b["bridgeid"] == bridgeid for b in bridges):
+                    bridges.append({"ip": ip, "bridgeid": bridgeid})
+                ip = bridgeid = None
+        if ip and bridgeid and not any(b["bridgeid"] == bridgeid for b in bridges):
+            bridges.append({"ip": ip, "bridgeid": bridgeid})
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if not bridges:
+        try:
+            with open("/dev/null"):
+                pass
+            req = urllib.request.Request("https://discovery.meethue.com/")
+            with urllib.request.build_opener().open(req, timeout=5) as resp:
+                for entry in json.loads(resp.read(65536).decode())[:5]:
+                    if entry.get("internalipaddress"):
+                        bridges.append({"ip": entry["internalipaddress"],
+                                        "bridgeid": None})
+        except Exception:
+            pass
+    return bridges
+
+
+def read_bridge_config(ip):
+    """One unauthenticated probe: returns {bridgeid, name} or None."""
+    try:
+        if TEST_BASE_URL:
+            status, payload = _http("GET", TEST_BASE_URL.rstrip("/") + "/config")
+        else:
+            status, payload = _http(
+                "GET", "https://{}/api/config".format(ip), timeout=5,
+                ctx=_tls_context(verify_hostname=False))
+        if status != 200 or not isinstance(payload, dict):
+            return None
+        bridgeid = payload.get("bridgeid")
+        if not isinstance(bridgeid, str) or not re.fullmatch(r"[0-9A-Fa-f]{16}", bridgeid):
+            return None
+        return {"bridgeid": bridgeid, "name": sanitize(payload.get("name") or "Hue Bridge")}
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------- color math -----
+
+def xy_to_rgb(x, y, brightness=0.75):
+    """CIE 1931 xy -> sRGB at a fixed display luminance (chromaticity only)."""
+    try:
+        x = float(x); y = float(y)
+        if y <= 1e-9 or x < 0 or y < 0 or x > 1 or y > 1:
+            return None
+        Y = 1.0
+        X = (Y / y) * x
+        Z = (Y - x * Y - y * Y) / y
+        # sRGB D65 matrix
+        r = 3.2406 * X - 1.5372 * Y - 0.4986 * Z
+        g = -0.9689 * X + 1.8758 * Y + 0.0415 * Z
+        b = 0.0557 * X - 0.2040 * Y + 1.0570 * Z
+        rgb = [min(1.0, max(0.0, c)) ** (1 / 2.2) for c in (r, g, b)]
+        m = max(rgb)
+        if m <= 1e-6:
+            return None
+        scale = brightness / m
+        return [min(1.0, c * scale) for c in rgb]
+    except (TypeError, ValueError):
+        return None
+
+
+def hs_to_rgb(hue, sat, value=0.75):
+    try:
+        return list(colorsys.hsv_to_rgb((float(hue) % 65536) / 65536.0,
+                                        min(1.0, float(sat) / 254.0), value))
+    except (TypeError, ValueError):
+        return None
+
+
+def ct_to_rgb(mirek, value=0.9):
+    """Approximate blackbody color for a mired value."""
+    try:
+        mirek = float(mirek)
+        if mirek <= 0:
+            return None
+        t = 1e6 / mirek
+        t = min(6600.0, max(1900.0, t)) / 100.0
+        if t <= 66:
+            r = 255.0
+            g = 99.47 * math.log(t) - 161.12
+        else:
+            r = 329.7 * (t - 60) ** -0.1332
+            g = 288.12 * (t - 60) ** -0.0755
+        b = 255.0 if t >= 66 else (0.0 if t <= 19 else 138.52 * math.log(t - 10) - 305.04)
+        norm = [min(255.0, max(0.0, c)) / 255.0 for c in (r, g, b)]
+        mx = max(norm)
+        return [c / mx * value if mx > 0 else value for c in norm] if mx > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def to_hex(rgb):
+    if not rgb:
+        return "#1c1c1c"
+    return "#{:02x}{:02x}{:02x}".format(*(int(round(255 * c)) for c in rgb))
+
+
+def light_hex(light_state):
+    """Chromaticity of a light as a hex string, for tints."""
+    if light_state.get("xy"):
+        rgb = xy_to_rgb(*light_state["xy"])
+        if rgb:
+            return to_hex(rgb)
+    if light_state.get("hue") is not None and light_state.get("sat") is not None:
+        rgb = hs_to_rgb(light_state["hue"], light_state["sat"])
+        if rgb:
+            return to_hex(rgb)
+    if light_state.get("ct") is not None:
+        rgb = ct_to_rgb(light_state["ct"])
+        if rgb:
+            return to_hex(rgb)
+    return "#c8a25e"  # warm default
+
+
+# ---------------------------------------------------- normalization -----
+
+def normalize_light(light_id, data):
+    state = data.get("state") or {}
+    caps = ((data.get("capabilities") or {}).get("control") or {})
+    has_bri = "bri" in state
+    has_ct = "ct" in state
+    has_color = "hue" in state and "sat" in state
+    ct_min = ct_max = None
+    ct_caps = caps.get("ct") or {}
+    if isinstance(ct_caps.get("min"), int) and isinstance(ct_caps.get("max"), int):
+        ct_min, ct_max = ct_caps["min"], ct_caps["max"]
+    xy = state.get("xy") if isinstance(state.get("xy"), list) and len(state["xy"]) == 2 else None
+    reachable = state.get("reachable", True) is True
+    on = state.get("on") is True
+    bri = state.get("bri")
+    return {
+        "id": str(light_id),
+        "name": sanitize(data.get("name") or "Light"),
+        "on": bool(on),
+        "bri": bri if isinstance(bri, int) else None,
+        "xy": xy,
+        "hex": light_hex(state) if on else "#1c1c1c",
+        "ct": state.get("ct"),
+        "ctMin": ct_min or 153,
+        "ctMax": ct_max or 500,
+        "hasBri": has_bri,
+        "hasCt": has_ct,
+        "hasColor": has_color,
+        "reachable": reachable,
+        "type": sanitize(data.get("type") or ""),
+    }
+
+
+def group_tint(group, lights_by_id):
+    """Average chromaticity of the group's ON lights. group action.bri is
+    the bridge's stale record of the last command — never trusted here."""
+    member_ids = group.get("lights") or []
+    rgbs = []
+    for lid in member_ids:
+        light = lights_by_id.get(str(lid))
+        if not light or not light["on"] or not light["reachable"]:
+            continue
+        state = light  # already normalized
+        rgb = None
+        if state["xy"]:
+            rgb = xy_to_rgb(*state["xy"])
+        elif state["hasColor"]:
+            raw = light.get("_raw") or {}
+            rgb = hs_to_rgb(raw.get("hue"), raw.get("sat"))
+        elif state["ct"] is not None:
+            rgb = ct_to_rgb(state["ct"])
+        if rgb:
+            rgbs.append(rgb)
+    action = group.get("action") or {}
+    if not rgbs:
+        # No lit members: fall back to the group's last commanded color,
+        # dimmed, so an off room still hints at what it was.
+        if action.get("xy"):
+            rgb = xy_to_rgb(*action["xy"], 0.25)
+        elif action.get("hue") is not None:
+            rgb = hs_to_rgb(action["hue"], action.get("sat", 254), 0.25)
+        elif action.get("ct") is not None:
+            rgb = ct_to_rgb(action["ct"], 0.25)
+        else:
+            rgb = [0.18, 0.12, 0.06]
+        return to_hex(rgb)
+    avg = [sum(c[i] for c in rgbs) / len(rgbs) for i in range(3)]
+    return to_hex(avg)
+
+
+def normalize_group(group_id, data, lights_by_id):
+    members = [str(l) for l in (data.get("lights") or [])]
+    on_members = [lights_by_id[i] for i in members if i in lights_by_id
+                  and lights_by_id[i]["on"] and lights_by_id[i]["reachable"]]
+    avg_bri = (sum(l["bri"] for l in on_members if l["bri"] is not None)
+               // len(on_members)) if on_members else None
+    action = data.get("action") or {}
+    return {
+        "id": str(group_id),
+        "name": sanitize(data.get("name") or "Room"),
+        "type": sanitize(data.get("type") or ""),      # Room / Zone / Luminaire
+        "class": sanitize(data.get("class") or ""),
+        "on": data.get("state", {}).get("any_on") is True,
+        "bri": avg_bri,
+        "tintHex": group_tint(data, lights_by_id) if lights_by_id
+                   else (to_hex(xy_to_rgb(*(action.get("xy") or [0, 0]), 0.25)
+                                if action.get("xy") else None)),
+        "lightIds": members,
+        "sceneIds": [str(s) for s in (data.get("scenes") or [])],
+    }
+
+
+def v1_error(payload, _status=None):
+    """v1 responses carry errors as [{"error": {...}}] lists."""
+    if isinstance(payload, list):
+        for entry in payload:
+            if isinstance(entry, dict) and "error" in entry:
+                desc = (entry["error"] or {}).get("description", "bridge error")
+                code_type = (entry["error"] or {}).get("type")
+                if code_type == 1:
+                    fail(EX_UNPAIRED, "unauthorized")
+                fail(EX_BAD_RESPONSE, str(desc))
+    return False
+
+
+# ------------------------------------------------------ subcommands -----
+
+def cmd_discover(_args):
+    bridges = discover_bridges()
+    for b in bridges:
+        if not b.get("bridgeid"):
+            info = read_bridge_config(b["ip"])
+            if info:
+                b["bridgeid"] = info["bridgeid"]
+                b["name"] = info["name"]
+    emit({"ok": True, "bridges": [b for b in bridges if b.get("bridgeid")]})
+    sys.exit(EX_OK)
+
+
+def cmd_pair(args):
+    """Streamed JSON lines so the QML side can show progress live:
+    discovering -> press-button(secondsLeft) -> paired."""
+    if TEST_BASE_URL:
+        # Headless pairing path against the fake bridge.
+        save_creds({"bridgeIp": "127.0.0.1", "bridgeId": "fakebridge",
+                    "username": "TESTUSERNAME1234567890AB", "apiVersion": "v1"})
+        emit({"ok": True, "event": "paired"})
+        sys.exit(EX_OK)
+
+    emit({"event": "discovering"})
+    ip, bridgeid = args.ip, args.bridgeid
+    if not ip:
+        bridges = discover_bridges()
+        if not bridges:
+            fail(EX_NETWORK, "no bridge found on this network")
+        ip = bridges[0]["ip"]
+        bridgeid = bridges[0].get("bridgeid")
+    if not bridgeid:
+        info = read_bridge_config(ip)
+        if not info:
+            fail(EX_NETWORK, "bridge at {} did not identify itself".format(ip))
+        bridgeid = info["bridgeid"]
+
+    deadline = time.monotonic() + PAIR_SECONDS
+    body = {"devicetype": "omarchue#panel", "generateclientkey": True}
+    username = None
+    while time.monotonic() < deadline:
+        remaining = int(deadline - time.monotonic())
+        emit({"event": "press-button", "secondsLeft": max(0, remaining)})
+        url = "https://{}/api".format(bridgeid.lower())
+        with _BridgeResolver(bridgeid, ip):
+            status, payload = _http("POST", url, body, timeout=5,
+                                    ctx=_tls_context())
+        if isinstance(payload, list):
+            for entry in payload:
+                if isinstance(entry, dict) and "success" in entry:
+                    username = (entry["success"] or {}).get("username")
+                    break
+                if isinstance(entry, dict) and entry.get("error", {}).get("type") == 101:
+                    pass  # link button not pressed yet
+        if username and _USERNAME_RE.fullmatch(username):
+            break
+        time.sleep(PAIR_RETRY_SECS)
+    if not username:
+        fail(EX_UNPAIRED, "link button was not pressed in time")
+
+    creds = {"bridgeIp": ip, "bridgeId": bridgeid.upper(),
+             "username": username, "apiVersion": "v1"}
+    save_creds(creds)
+    emit({"event": "paired", "bridge": {"ip": ip, "bridgeid": bridgeid.upper(),
+                                        "apiVersion": "v1"}})
+    sys.exit(EX_OK)
+
+
+def cmd_get_status(_args):
+    """Ambient snapshot: rooms + scenes, no lights payload (bar widget)."""
+    creds = load_creds()
+    groups, st = bridge_request("GET", "/groups")
+    v1_error(groups, st)
+    scenes = []
+    try:
+        scenes, _ = bridge_request("GET", "/scenes")
+    except SystemExit:
+        scenes = []  # scenes are decorative for the ambient view
+    if not isinstance(groups, dict):
+        fail(EX_BAD_RESPONSE, "unexpected groups payload")
+    out_groups = []
+    for gid, data in (groups or {}).items():
+        if not isinstance(data, dict):
+            continue
+        # Same canonical filter as get-state: Entertainment and auto-created
+        # LightGroups (motion apps, Hue Sync, …) are not user-facing rooms.
+        if data.get("type") not in ("Room", "Zone"):
+            continue
+        action = data.get("action") or {}
+        tint = "#1c1c1c"
+        if action.get("xy"):
+            tint = to_hex(xy_to_rgb(*action["xy"], 0.6) or [0.1, 0.1, 0.1])
+        elif action.get("hue") is not None:
+            tint = to_hex(hs_to_rgb(action["hue"], action.get("sat", 254), 0.6))
+        out_groups.append({
+            "id": str(gid),
+            "name": sanitize(data.get("name") or "Room"),
+            "type": sanitize(data.get("type") or ""),
+            "class": sanitize(data.get("class") or ""),
+            "on": data.get("state", {}).get("any_on") is True,
+            "bri": action.get("bri"),
+            "tintHex": tint,
+            "lightIds": [str(l) for l in (data.get("lights") or [])],
+            "sceneIds": [str(s) for s in (data.get("scenes") or [])],
+        })
+    emit({"ok": True, "groups": out_groups, "scenes": _normalize_scenes(scenes)})
+
+
+def _normalize_scenes(raw_scenes):
+    out = []
+    for sid, data in (raw_scenes or {}).items() if isinstance(raw_scenes, dict) else []:
+        if not isinstance(data, dict):
+            continue
+        out.append({
+            "id": str(sid),
+            "name": sanitize(data.get("name") or "Scene"),
+            "group": str(data.get("group")) if data.get("group") else None,
+            "type": sanitize(data.get("type") or ""),
+        })
+    return out
+
+
+def cmd_get_state(_args):
+    """Full snapshot in one request: GET /api/<user> returns lights, groups
+    and scenes together — one round trip for all 41 lights."""
+    creds = load_creds()
+    full, st = bridge_request("GET", "")
+    v1_error(full, st)
+    if not isinstance(full, dict) or "lights" not in full \
+            or "groups" not in full:
+        # A payload that is "successful" but structurally wrong must fail
+        # loudly — returning empty models would look like "no lights".
+        fail(EX_BAD_RESPONSE, "unexpected full-state payload")
+    lights = {}
+    for lid, data in (full.get("lights") or {}).items():
+        if isinstance(data, dict):
+            lights[str(lid)] = normalize_light(lid, data)
+            lights[str(lid)]["_raw"] = data.get("state") or {}
+    groups = []
+    for gid, data in (full.get("groups") or {}).items():
+        if isinstance(data, dict) and data.get("type") in ("Room", "Zone"):
+            groups.append(normalize_group(gid, data, lights))
+    for g in groups:
+        g.pop("_raw", None)
+    for l in lights.values():
+        l.pop("_raw", None)
+    emit({"ok": True,
+          "bridge": {"ip": creds["bridgeIp"], "bridgeid": creds["bridgeId"]},
+          "groups": groups, "lights": lights,
+          "scenes": _normalize_scenes(full.get("scenes"))})
+
+
+def _read_body(args):
+    """Action body: --body '<json>' when the caller is QML (Quickshell's
+    Process.write + stdinEnabled=false does not deliver stdin data in
+    0.3.1), stdin as a fallback for manual/pipe use."""
+    raw = getattr(args, "body", None)
+    if raw is None:
+        raw = sys.stdin.read(MAX_RESPONSE_BYTES)
+    try:
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            raise ValueError
+        return body
+    except (ValueError, OSError):
+        fail(EX_USAGE, "invalid JSON body")
+
+
+def cmd_put_group(args):
+    if not args.id:
+        fail(EX_USAGE, "put-group needs a group id")
+    body = _read_body(args)
+    creds = load_creds()
+    allowed = {}
+    if "on" in body:
+        action = {"on": bool(body["on"])}
+        if body.get("bri") is not None:
+            action["bri"] = max(1, min(254, int(body["bri"])))
+        if body.get("scene"):
+            action = {"scene": str(body["scene"])}
+        allowed = action
+    elif body.get("scene"):
+        allowed = {"scene": str(body["scene"])}
+    else:
+        if body.get("bri") is not None:
+            allowed = {"bri": int(max(1, min(254, body["bri"])))}
+        else:
+            fail(EX_USAGE, "nothing to do")
+    payload, st = bridge_request("PUT", "/groups/{}/action".format(args.id),
+                                 allowed)
+    v1_error(payload, st)
+    errors = []
+    if isinstance(payload, list):
+        for entry in payload:
+            if isinstance(entry, dict) and "error" in entry:
+                errors.append(str((entry["error"] or {}).get("description", "error")))
+    emit({"ok": True, "errors": errors})
+    sys.exit(EX_OK if not errors else EX_BAD_RESPONSE)
+
+
+def cmd_put_light(args):
+    if not args.id:
+        fail(EX_USAGE, "missing light id")
+    body = _read_body(args)
+    state = {}
+    if "on" in body:
+        state["on"] = bool(body["on"])
+    if body.get("bri") is not None:
+        state["bri"] = int(max(1, min(254, body["bri"])))
+    if body.get("xy"):
+        state["xy"] = [round(float(body["xy"][0]), 4), round(float(body["xy"][1]), 4)]
+    if body.get("ct") is not None:
+        state["ct"] = int(max(153, min(500, body["ct"])))
+    if not state:
+        fail(EX_USAGE, "nothing to do")
+    creds = load_creds()
+    payload, st = bridge_request("PUT", "/lights/{}/state".format(args.id),
+                                 state)
+    v1_error(payload, st)
+    errors = []
+    if isinstance(payload, list):
+        for entry in payload:
+            if isinstance(entry, dict) and "error" in entry:
+                errors.append(str((entry["error"] or {}).get("description", "error")))
+    emit({"ok": True, "errors": errors})
+    sys.exit(EX_OK if not errors else EX_BAD_RESPONSE)
+
+
+def cmd_probe_v2(_args):
+    """The v1 username doubles as the v2 application key — no re-pairing.
+    CLIP v2 normalization is deliberately deferred; this only records it."""
+    creds = load_creds()
+    headers = {"hue-application-key": creds["username"]}
+    if TEST_BASE_URL:
+        status, payload = _http("GET", TEST_BASE_URL.rstrip("/") + "/clip/v2/resource/bridge",
+                                headers=headers)
+    else:
+        with _BridgeResolver(creds["bridgeId"], creds["bridgeIp"]):
+            status, payload = _http(
+                "GET", "https://{}/clip/v2/resource/bridge".format(creds["bridgeId"].lower()),
+                headers=headers)
+    v2 = status == 200 and isinstance(payload, dict) \
+        and isinstance(payload.get("data"), list) and not payload.get("errors")
+    if v2:
+        creds["apiVersion"] = "v2"
+        save_creds(creds)
+    emit({"ok": True, "v2": bool(v2)})
+    sys.exit(EX_OK)
+
+
+def cmd_unpair(_args):
+    try:
+        STATE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print("could not remove credentials: {}".format(e), file=sys.stderr)
+        fail(EX_NETWORK, "could not remove credentials")
+    emit({"ok": True})
+    sys.exit(EX_OK)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="hue_api", description="Omarchue bridge helper")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("discover")
+    p_pair = sub.add_parser("pair")
+    p_pair.add_argument("--ip")
+    p_pair.add_argument("--bridgeid")
+    sub.add_parser("get-status")
+    sub.add_parser("get-state")
+    p_group = sub.add_parser("put-group")
+    p_group.add_argument("id")
+    p_group.add_argument("--body")
+    p_light = sub.add_parser("put-light")
+    p_light.add_argument("id")
+    p_light.add_argument("--body")
+    sub.add_parser("probe-v2")
+    sub.add_parser("unpair")
+    args = parser.parse_args()
+
+    handlers = {
+        "discover": cmd_discover,
+        "pair": cmd_pair,
+        "get-status": cmd_get_status,
+        "get-state": cmd_get_state,
+        "put-group": cmd_put_group,
+        "put-light": cmd_put_light,
+        "probe-v2": cmd_probe_v2,
+        "unpair": cmd_unpair,
+    }
+    if not args.cmd:
+        parser.print_usage(sys.stderr)
+        sys.exit(EX_USAGE)
+    handlers[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+{
+  "pollIntervalSec": 15,
+  "ambientPollSec": 30,
+  "resyncMs": 700,
+  "sceneRefetchMs": 900,
+  "debouncedSendMs": 120,
+  "panelWidth": 360
+}
