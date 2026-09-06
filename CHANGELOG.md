@@ -12,7 +12,8 @@ Hue Sync: native entertainment streaming.
 - Channel-aware sampling: area channel positions map onto a 5x3 grid
   of the screen, so left lights follow the left of the screen.
 - wf-recorder captures the chosen monitor at 30 fps, downsampled to a
-  64x36 rgb24 feed in one process.
+  64x36 rgb24 feed through a FIFO (stdout streaming is broken with
+  wf-recorder 0.6 + ffmpeg 9).
 - Streaming-key pairing through the panel (one bridge-button press),
   credentials stored with the main pair, 0600.
 - Clean teardown: stream deactivated and the pre-stream state restored
