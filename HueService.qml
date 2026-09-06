@@ -402,6 +402,12 @@ Item {
     return null
   }
 
+  function roomById(groupId) {
+    for (var i = 0; i < groups.length; i++)
+      if (groups[i].id === groupId) return groups[i]
+    return null
+  }
+
   function scenesFor(groupId) {
     var out = []
     for (var i = 0; i < scenes.length; i++)

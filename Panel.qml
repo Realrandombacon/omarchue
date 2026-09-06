@@ -4,10 +4,10 @@ import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 
-// Omarchue control panel — M1: a flat list. One row per room/zone with a
-// power toggle and brightness slider, plus global all-on/all-off and scene
-// chips. The Android-style room tiles come in M2; navigation stays flat so
-// the service contract gets exercised first.
+// Omarchue control panel — two-level Android-app navigation: a home grid
+// of room tiles (plus a global "Tout" on/off tile), then one room's detail
+// view with scene chips and per-light color controls. The service injects
+// all state; the panel is a pure view.
 Item {
   id: root
 
@@ -41,27 +41,11 @@ Item {
     if (service) service.setPanelOpen(opened)
   }
 
-  function toggleGroup(group) {
-    if (!service) return
-    service.setGroupOn(group.id, !group.on)
-  }
-
-  function setGroupBrightness(group, v) {
-    if (!service) return
-    service.setGroupBri(group.id, v)
-  }
-
-  function releaseGroupBrightness(group) {
-    if (!service) return
-    service.endEdits()
-  }
-
-  function allOn(on) {
-    if (!service) return
-    service.beginEdits()
-    service.setAllOn(on)
-    service.endEdits()
-  }
+  // Two-level navigation: null = home (room grid), a room id = detail view.
+  // Sibling Items with visible-swap (not StackView/Loader) so scroll and
+  // drag state survive navigation; the room object is re-resolved by id on
+  // every snapshot so the detail view never shows stale state.
+  property var currentRoomId: null
 
   PanelWindow {
     id: win
@@ -169,141 +153,44 @@ Item {
             onPairingDone: root.dismiss()
           }
 
-          // ---- Paired: global controls + one row per room
-          Column {
+          // ---- Paired: two-level navigation (home grid | room detail)
+          Item {
             width: parent.width
-            spacing: Style.space(14)
             visible: service && service.isPaired
+            height: visible ? (root.currentRoomId ? roomView.implicitHeight
+                                                  : homeView.implicitHeight) : 0
 
-            Row {
-              spacing: Style.space(12)
-
-              Button {
-                text: "All on"
-                onClicked: root.allOn(true)
-              }
-
-              Button {
-                text: "All off"
-                onClicked: root.allOn(false)
-              }
+            RoomGrid {
+              id: homeView
+              anchors.top: parent.top
+              anchors.left: parent.left
+              anchors.right: parent.right
+              visible: !root.currentRoomId
+              service: root.service
+              onOpenRoom: function(room) { root.currentRoomId = room ? room.id : null }
             }
 
-            PanelSeparator {}
+            RoomView {
+              id: roomView
+              anchors.top: parent.top
+              anchors.left: parent.left
+              anchors.right: parent.right
+              visible: root.currentRoomId !== null
+              service: root.service
+              room: root.currentRoomId && root.service
+                    ? root.service.roomById(root.currentRoomId) : null
+              onBack: root.currentRoomId = null
+            }
+          }
 
-            Repeater {
-              model: service ? service.groups : []
-
-              delegate: Column {
-                id: groupBlock
-                width: parent.width
-                spacing: Style.space(6)
-                required property int index
-                required property var modelData
-
-                // Room header: tint dot, name, power toggle.
-                Item {
-                  width: parent.width
-                  height: Style.space(30)
-
-                  Rectangle {
-                    id: dot
-                    anchors.left: parent.left
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: Style.space(12)
-                    height: width
-                    radius: width / 2
-                    color: groupBlock.modelData.tintHex || "#444444"
-                    opacity: groupBlock.modelData.on ? 1.0 : 0.35
-                  }
-
-                  Text {
-                    anchors.left: dot.right
-                    anchors.leftMargin: Style.space(10)
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: parent.width - Style.space(70)
-                    text: groupBlock.modelData.name
-                    color: Color.popups.text
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.body
-                    elide: Text.ElideRight
-                  }
-
-                  ToggleSwitch {
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
-                    checked: groupBlock.modelData.on
-                    interactive: root.service !== null
-                    onToggled: root.toggleGroup(groupBlock.modelData)
-                  }
-                }
-
-                // Room brightness (any controllable member ⇒ useful).
-                HuePanelRow {
-                  width: parent.width
-                  visible: root.service && groupBlock.modelData.bri !== null
-                  label: "Bright"
-                  hint: "Brightness of every reachable bulb in " +
-                        groupBlock.modelData.name + ". Off or unreachable bulbs are skipped."
-                  detail: groupBlock.modelData.bri !== null
-                          ? Math.round(groupBlock.modelData.bri / 254 * 100) + " %" : ""
-                  minimum: 1
-                  maximum: 254
-                  step: 1
-                  integer: true
-                  value: groupBlock.modelData.bri !== null ? groupBlock.modelData.bri : 1
-                  onMoved: function(v) {
-                    root.service.beginEdits()
-                    root.setGroupBrightness(groupBlock.modelData, v)
-                  }
-                  onReleased: function(v) { root.releaseGroupBrightness(groupBlock.modelData) }
-                }
-
-                // Scene chips for this room.
-                Flow {
-                  width: parent.width
-                  spacing: Style.space(8)
-                  visible: root.service && root.service.scenesFor(groupBlock.modelData.id).length > 0
-
-                  Repeater {
-                    model: root.service ? root.service.scenesFor(groupBlock.modelData.id) : []
-
-                    delegate: Rectangle {
-                      width: chipText.implicitWidth + Style.space(20)
-                      height: chipText.implicitHeight + Style.space(10)
-                      radius: height / 2
-                      required property var modelData
-                      color: chipMouse.containsMouse
-                             ? Qt.darker(Color.popups.background, 1.2)
-                             : Color.popups.background
-                      border.width: Style.normalBorderWidth
-                      border.color: chipMouse.containsMouse ? Color.accent : Color.popups.border
-
-                      Text {
-                        id: chipText
-                        anchors.centerIn: parent
-                        text: parent.modelData.name
-                        color: Color.popups.text
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
-                      }
-
-                      MouseArea {
-                        id: chipMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.service.recallScene(parent.modelData.id,
-                                                            groupBlock.modelData.id)
-                      }
-                    }
-                  }
-                }
-
-                PanelSeparator {
-                  visible: index < (service ? service.groups.length : 0) - 1
-                }
-              }
+          Connections {
+            target: service
+            // The room vanished from the bridge while its view was open —
+            // fall back to the grid instead of showing an empty detail page.
+            function onGroupsChanged() {
+              if (root.currentRoomId && root.service &&
+                  !root.service.roomById(root.currentRoomId))
+                root.currentRoomId = null
             }
           }
         }
