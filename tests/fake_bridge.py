@@ -16,6 +16,7 @@ STATE = {
     "groups": {},
     "scenes": {},
     "v2scenes": {},
+    "v2areas": {},
     "config": {"bridgeid": "001788FFFE123456", "name": "Bacon's Bridge",
                "apiversion": "1.62.0"},
     # Bookkeeping for tests: every request the helper made.
@@ -68,8 +69,18 @@ def build_state():
         "4": _group("4", "Office", "Office",
                     [str(i) for i in list(range(32, 41)) + ["41"]]),
     }
+    # Entertainment area (v1 view): stream attribute + per-light locations.
+    groups["11"] = {
+        "name": "Gaming Den", "type": "Entertainment", "class": "TV",
+        "lights": ["1", "2", "3"],
+        "state": {"all_on": True, "any_on": True},
+        "action": {"on": True, "bri": 200, "xy": [0.4573, 0.4053]},
+        "stream": {"active": False, "owner": None},
+        "locations": {"1": [-1.0, 0.8, 0.0], "2": [0.0, 0.8, 0.0],
+                      "3": [1.0, 0.8, 0.0]},
+    }
     STATE.update({"lights": lights, "groups": groups, "scenes": scenes,
-                  "v2scenes": {}, "requests": []})
+                  "v2scenes": {}, "v2areas": {}, "requests": []})
     # CLIP v2 mirror of the scenes. s1 carries a palette (dynamic-capable);
     # the others are static. status.active mirrors real bridge values
     # ("inactive" / "static" / "dynamic").
@@ -88,6 +99,21 @@ def build_state():
             "status": {"active": "inactive"},
             "actions": [],
         }
+    # CLIP v2 mirror of the entertainment area. Channels carry the screen
+    # positions (x, y in -1..1) the streamer samples with.
+    STATE["v2areas"]["ent-1"] = {
+        "id": "ent-1",
+        "id_v1": "/groups/11",
+        "type": "entertainment_configuration",
+        "metadata": {"name": "Gaming Den"},
+        "configuration_type": "screen",
+        "status": {"active": "inactive"},
+        "channels": [
+            {"channel_id": 0, "position": {"x": -1.0, "y": 0.8, "z": 0.0}},
+            {"channel_id": 1, "position": {"x": 0.0, "y": 0.8, "z": 0.0}},
+            {"channel_id": 2, "position": {"x": 1.0, "y": 0.8, "z": 0.0}},
+        ],
+    }
     return STATE
 
 
@@ -191,9 +217,14 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
             return self._send(200, STATE["config"])
         if path == "/clip/v2/resource/scene":
             if not self._v2_authorized():
-                return self._send(403, {"errors": [{"description":
+                return self._send(401, {"errors": [{"description":
                                                     "unauthorized"}]})
             return self._v2(200, list(STATE["v2scenes"].values()))
+        if path == "/clip/v2/resource/entertainment_configuration":
+            if not self._v2_authorized():
+                return self._send(401, {"errors": [{"description":
+                                                    "unauthorized"}]})
+            return self._v2(200, list(STATE["v2areas"].values()))
         # Any authenticated path under the wrong username is a 401-style
         # v1 error, like the real bridge.
         if path.startswith("/api/") and _USER not in path.split("/"):
@@ -248,6 +279,15 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
             if "speed" in body:
                 sc["speed"] = body["speed"]
             return self._v2(200, [{"id": sc["id"], "status": sc["status"]}])
+        # api/<user>/groups/<gid> — attribute PUT (streaming activation).
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == _USER \
+                and parts[2] == "groups" and parts[3] in STATE["groups"]:
+            if "stream" in body:
+                STATE["groups"][parts[3]]["stream"]["active"] = \
+                    bool(body["stream"].get("active"))
+                return self._send(200, [{"success": {
+                    "/groups/{}/stream/active".format(parts[3]):
+                        bool(body["stream"].get("active"))}}])
         # api/<user>/groups/<gid>/action | api/<user>/lights/<lid>/state
         if len(parts) == 5 and parts[0] == "api" and parts[1] == _USER:
             if parts[2] == "groups" and parts[4] == "action" \

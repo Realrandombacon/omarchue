@@ -791,6 +791,47 @@ def cmd_v2_recall(args):
     sys.exit(EX_OK)
 
 
+def cmd_sync_areas(_args):
+    """Entertainment areas from CLIP v2, keyed back to their v1 group ids.
+    Each area carries a compact channel map {channel_id: [x, y]} (positions
+    normalized -1..1) the streamer uses to map screen regions to channels."""
+    data = v2_data(*v2_request("GET",
+                               "/resource/entertainment_configuration"))
+    areas = []
+    for a in data or []:
+        if not isinstance(a, dict) or not a.get("id_v1"):
+            continue
+        channels = {}
+        for ch in a.get("channels") or []:
+            pos = ch.get("position") or {}
+            channels[str(ch["channel_id"])] = [
+                round(float(pos.get("x") or 0.0), 4),
+                round(float(pos.get("y") or 0.0), 4)]
+        areas.append({
+            "id": a["id"],
+            "v1Id": str(a["id_v1"]).rsplit("/", 1)[-1],
+            "name": sanitize((a.get("metadata") or {}).get("name")
+                             or a.get("name") or "Area"),
+            "type": a.get("configuration_type"),
+            "channels": channels,
+        })
+    emit({"ok": True, "areas": areas})
+    sys.exit(EX_OK)
+
+
+def cmd_sync_stop(args):
+    """Safety valve: force-deactivate a group's streaming (v1 attribute
+    PUT, the same endpoint the real streaming session uses)."""
+    if not args.id:
+        fail(EX_USAGE, "sync-stop needs a group id")
+    creds = load_creds()
+    payload, st = bridge_request("PUT", "/groups/{}".format(args.id),
+                                 {"stream": {"active": False}})
+    v1_error(payload, st)
+    emit({"ok": True, "errors": []})
+    sys.exit(EX_OK)
+
+
 def cmd_unpair(_args):
     try:
         STATE_PATH.unlink()
@@ -825,6 +866,9 @@ def main():
     p_v2recall.add_argument("--action", default="dynamic")
     p_v2recall.add_argument("--speed")
     p_v2recall.add_argument("--body")
+    sub.add_parser("sync-areas")
+    p_syncstop = sub.add_parser("sync-stop")
+    p_syncstop.add_argument("id")
     sub.add_parser("unpair")
     args = parser.parse_args()
 
@@ -838,6 +882,8 @@ def main():
         "probe-v2": cmd_probe_v2,
         "v2-scenes": cmd_v2_scenes,
         "v2-recall": cmd_v2_recall,
+        "sync-areas": cmd_sync_areas,
+        "sync-stop": cmd_sync_stop,
         "unpair": cmd_unpair,
     }
     if not args.cmd:
