@@ -13,9 +13,16 @@ QSB=/usr/lib/qt6/bin/qsb
 # .git) stays in the dev checkout.
 FILES=(manifest.json HueService.qml Panel.qml PairingView.qml RoomGrid.qml
        RoomTile.qml RoomView.qml LightRow.qml ColorWheel.qml SceneChip.qml
-       HuePanelRow.qml BarWidget.qml defaults.json hue_api.py
+       HuePanelRow.qml BarWidget.qml SyncView.qml defaults.json hue_api.py
        hue_bridge_cacert.pem
        colorwheel.frag colorwheel.frag.qsb preview.png)
+
+# Vendored hue-entertainment DTLS transport (Apache-2.0, see vendor/ LICENSE).
+mkdir -p "$DEST/vendor/hue_entertainment"
+for f in __init__.py constants.py models.py dtls.py LICENSE; do
+  [[ -f "$HERE/vendor/hue_entertainment/$f" ]] && \
+    cp -f "$HERE/vendor/hue_entertainment/$f" "$DEST/vendor/hue_entertainment/"
+done
 
 mkdir -p "$DEST"
 

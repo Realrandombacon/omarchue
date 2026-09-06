@@ -16,6 +16,7 @@ animating the lights through their palette just like the official app.
 | **Room view** (`RoomView.qml`) | Room power + brightness, scene chips, and one row per bulb |
 | **Light rows** (`LightRow.qml`) | Per-bulb toggle and brightness; White Ambiance bulbs get a temperature gradient, RGB bulbs get a shader color wheel — capability flags come straight from the bridge, so any bulb type does the right thing |
 | **Dynamic scenes** (`SceneChip.qml`) | Scenes with a color palette carry a play mark; tap to start the animated palette, tap again to stop. Playback state resyncs from the bridge, so the official app and the panel agree |
+| **Hue Sync** (`SyncView.qml` + `sync-stream`) | Entertainment-area chips that stream the screen's colors to the lights over bridge-native DTLS — the same protocol the Hue Sync app speaks. Channel positions map onto the screen, monitor picker + intensity included |
 | **Bar widget** (`BarWidget.qml`) | Lightbulb icon — amber while any light is on, red while the bridge is unreachable. Left click opens the panel, right click kills every light |
 | **Bridge helper** (`hue_api.py` + `tests/`) | Stdlib-only Python helper: TLS pinned to the bridge's Signify CA, mDNS discovery, streaming pairing, v1 state normalization and CLIP v2 dynamic playback. 54 headless tests |
 
@@ -61,6 +62,27 @@ omarchy-shell omarchue set '{"allOn": false}'
 omarchy-shell omarchue set '{"group":"1","bri":120}'
 omarchy-shell omarchue status
 ```
+
+## Hue Sync (screen streaming)
+
+Open the panel, scroll under the room grid: pick your entertainment area
+(chip), tap it, and the lights follow the screen at the bridge's own
+streaming rate (30 fps, DTLS 1.2, UDP — the Hue Sync protocol itself).
+Channel positions from the area drive which part of the screen each
+light mirrors, so a gradient strip sweeps left to right with the image.
+Tap the chip again to stop — the pre-stream state is restored.
+
+First run pairs a dedicated streaming key: one press of the bridge's
+link button, from the panel. Two extra packages are needed:
+
+```
+sudo pacman -S python-cryptography wf-recorder
+```
+
+(`cryptography` does the AES-GCM of the DTLS handshake, `wf-recorder`
+captures a chosen Hyprland monitor at 30 fps.) The DTLS transport is
+[vendored](https://github.com/music-assistant/hue-entertainment)
+(Apache-2.0) — no pip, no venv.
 
 ## Notes
 

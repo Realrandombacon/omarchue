@@ -183,6 +183,13 @@ Item {
             }
           }
 
+          // ---- Paired, home level: Hue Sync (screen streaming)
+          SyncView {
+            width: parent.width
+            visible: service && service.isPaired && !root.currentRoomId
+            service: root.service
+          }
+
           Connections {
             target: service
             // The room vanished from the bridge while its view was open —

@@ -802,6 +802,8 @@ def cmd_sync_areas(_args):
     normalized -1..1) the streamer uses to map screen regions to channels."""
     data = v2_data(*v2_request("GET",
                                "/resource/entertainment_configuration"))
+    creds = load_creds()
+    sync_ready = bool(creds.get("syncUsername") and creds.get("syncClientkey"))
     areas = []
     for a in data or []:
         if not isinstance(a, dict) or not a.get("id_v1"):
@@ -820,7 +822,7 @@ def cmd_sync_areas(_args):
             "type": a.get("configuration_type"),
             "channels": channels,
         })
-    emit({"ok": True, "areas": areas})
+    emit({"ok": True, "areas": areas, "syncReady": sync_ready})
     sys.exit(EX_OK)
 
 

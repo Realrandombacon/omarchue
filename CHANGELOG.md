@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.1.0 — 2026-09-06
+
+Hue Sync: native entertainment streaming.
+
+- Screen sync on any entertainment area: the panel lists the bridge's
+  areas (CLIP v2) as chips; tap to start, tap again to stop.
+- Bridge-native streaming: DTLS 1.2 PSK over UDP (vendored
+  music-assistant/hue-entertainment transport, Apache-2.0) at the
+  bridge's own streaming rate — same protocol as the Hue Sync app.
+- Channel-aware sampling: area channel positions map onto a 5x3 grid
+  of the screen, so left lights follow the left of the screen.
+- wf-recorder captures the chosen monitor at 30 fps, downsampled to a
+  64x36 rgb24 feed in one process.
+- Streaming-key pairing through the panel (one bridge-button press),
+  credentials stored with the main pair, 0600.
+- Clean teardown: stream deactivated and the pre-stream state restored
+  on stop, SIGTERM or capture death.
+- Monitor picker (Hyprland) and intensity slider.
+
+Requires `python-cryptography` and `wf-recorder` (pacman).
+
 ## 1.0.0 — 2026-09-06
 
 First release.

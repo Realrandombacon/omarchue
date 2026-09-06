@@ -133,8 +133,12 @@ Item {
 
   function setPanelOpen(open) {
     panelOpen = open
-    if (open) refresh()
-    if (open) fetchDynamics()
+    if (open) {
+      refresh()
+      fetchDynamics()
+      fetchSyncAreas()
+      listOutputs()
+    }
   }
 
   // ---- Polling -----------------------------------------------------------
@@ -182,6 +186,10 @@ Item {
     scenes = []
     lights = ({})
     bridge = ({})
+    syncAreas = []
+    syncActiveId = ""
+    syncStatus = "idle"
+    clientKeyReady = false
     lastError = ""
     unpairProc.command = helperCmd(["unpair"])
     unpairProc.running = true
@@ -422,6 +430,175 @@ Item {
 
   function sceneIsDynamic(sceneId) {
     return dynamicScenes[sceneId] !== undefined
+  }
+
+  // ---- Hue Sync (screen streaming) ----------------------------------------
+  // Entertainment areas stream screen colors to their channels over DTLS.
+  // One long-lived helper process per sync (sync-stream); the bridge auto-
+  // drops a stream ~10 s after the last frame, so a lost process self-heals.
+  property var syncAreas: []            // {v1Id, name, type, channels}
+  property string syncActiveId: ""      // v1 group id currently streaming
+  property string syncStatus: "idle"    // idle | starting | streaming
+  property bool clientKeyReady: false   // syncUsername/syncClientkey saved?
+  property string syncOutput: "eDP-2"
+  property real syncIntensity: 0.8
+  property var outputs: []              // monitor names for the picker
+  property string syncPairEvent: ""     // "" | discovering | press-button | paired
+  property int syncPairSecondsLeft: 0
+  property string _syncStderr: ""
+
+  Process {
+    id: syncAreasProc
+    command: []
+    stdout: StdioCollector {
+      onStreamFinished: root.applySyncAreas(text)
+    }
+  }
+
+  function fetchSyncAreas() {
+    if (!isPaired || syncAreasProc.running) return
+    syncAreasProc.command = helperCmd(["sync-areas"])
+    syncAreasProc.running = true
+  }
+
+  function applySyncAreas(raw) {
+    raw = String(raw || "").trim()
+    if (raw === "") return
+    var snap
+    try { snap = JSON.parse(raw) } catch (e) {
+      console.warn("omarchue: malformed sync-areas output:", e)
+      return
+    }
+    if (snap.ok !== true) return
+    clientKeyReady = snap.syncReady === true
+    syncAreas = snap.areas || []
+  }
+
+  Process {
+    id: syncPairProc
+    command: []
+    stdout: SplitParser {
+      onRead: function(data) { root.handleSyncPairLine(data) }
+    }
+    stderr: StdioCollector {
+      onStreamFinished: {
+        if (String(text).trim() !== "") console.warn("omarchue sync-pair:", String(text).trim())
+      }
+    }
+    onExited: {
+      if (root.syncPairEvent !== "paired") root.syncPairEvent = ""
+    }
+  }
+
+  function beginSyncPairing() {
+    if (syncPairProc.running) return
+    syncPairEvent = "discovering"
+    syncPairSecondsLeft = 0
+    syncPairProc.command = helperCmd(["sync-pair"])
+    syncPairProc.running = true
+  }
+
+  function cancelSyncPairing() {
+    if (syncPairProc.running) syncPairProc.running = false
+    syncPairEvent = ""
+  }
+
+  function handleSyncPairLine(line) {
+    line = String(line || "").trim()
+    if (line === "") return
+    var ev
+    try { ev = JSON.parse(line) } catch (e) { return }
+    if (ev.event === "discovering" || ev.event === "press-button") {
+      syncPairEvent = ev.event
+      if (ev.event === "press-button") syncPairSecondsLeft = ev.secondsLeft || 0
+    } else if (ev.event === "paired") {
+      syncPairEvent = "paired"
+      clientKeyReady = true
+      fetchSyncAreas()
+    } else if (ev.ok === false && ev.code !== undefined) {
+      syncPairEvent = ""
+      lastError = ev.error || "Sync pairing failed"
+    }
+  }
+
+  Process {
+    id: syncProc
+    command: []
+    stdout: SplitParser {
+      onRead: function(data) { root.handleSyncLine(data) }
+    }
+    stderr: StdioCollector {
+      onStreamFinished: root._syncStderr = String(text).trim()
+    }
+    onExited: function(exitCode) { root.handleSyncExit(exitCode) }
+  }
+
+  function startSync(v1Id) {
+    if (!isPaired || syncProc.running) return
+    syncActiveId = v1Id
+    syncStatus = "starting"
+    _syncStderr = ""
+    syncProc.command = helperCmd(["sync-stream", v1Id,
+                                  "--output", syncOutput,
+                                  "--intensity", String(syncIntensity)])
+    syncProc.running = true
+  }
+
+  function stopSync() {
+    // SIGTERM: the helper deactivates the stream and restores the snapshot.
+    syncStatus = "idle"
+    if (syncProc.running) syncProc.running = false
+    syncActiveId = ""
+  }
+
+  function handleSyncLine(line) {
+    line = String(line || "").trim()
+    if (line === "") return
+    var ev
+    try { ev = JSON.parse(line) } catch (e) { return }
+    if (ev.event === "capturing") syncStatus = "starting"
+    else if (ev.event === "streaming") syncStatus = "streaming"
+    else if (ev.event === "stopped") {
+      syncStatus = "idle"
+      syncActiveId = ""
+    }
+  }
+
+  function handleSyncExit(exitCode) {
+    if (syncActiveId !== "") {
+      // Unexpected exit: the bridge still self-heals after ~10 s, but a
+      // failed handshake or missing dependency should be visible.
+      syncActiveId = ""
+      syncStatus = "idle"
+      if (exitCode === 1) lastError = "Bridge unreachable"
+      else if (exitCode === 2) lastError = "Sync key rejected — pair Hue Sync again"
+      else if (exitCode === 4) lastError = _syncStderr !== "" ? _syncStderr
+                                                             : "Sync unavailable"
+      else lastError = "Sync stopped unexpectedly"
+    }
+  }
+
+  Process {
+    id: outputsProc
+    command: []
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var ms = JSON.parse(text)
+          var names = []
+          for (var i = 0; i < ms.length; i++)
+            if (ms[i] && ms[i].name) names.push(String(ms[i].name))
+          if (names.length > 0) outputs = names
+        } catch (e) {
+          console.warn("omarchue: hyprctl monitors output unreadable:", e)
+        }
+      }
+    }
+  }
+
+  function listOutputs() {
+    outputsProc.command = ["hyprctl", "monitors", "-j"]
+    outputsProc.running = true
   }
 
   function applySnapshot(raw) {
