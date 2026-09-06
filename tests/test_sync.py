@@ -86,6 +86,26 @@ class SyncCliTest(unittest.TestCase):
 
     # No missing-id test: argparse exits 2 before our exit codes apply.
 
+    # ---- sync-pair / sync-stream --------------------------------------------
+
+    def test_sync_pair_testmode_saves_credentials(self):
+        proc = self.run_cli("sync-pair")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        creds = json.loads(Path(self.state_dir, "omarchy", "settings",
+                                "hue.json").read_text())
+        self.assertTrue(creds.get("syncUsername"))
+        self.assertEqual(len(creds.get("syncClientkey") or ""), 32)
+
+    def test_sync_stream_requires_sync_credentials(self):
+        # Rebuild creds without the sync pair.
+        Path(self.state_dir, "omarchy", "settings", "hue.json").write_text(
+            json.dumps(CREDS) + "\n")
+        proc = self.run_cli("sync-stream", "11")
+        self.assertEqual(proc.returncode, 2)  # EX_UNPAIRED
+        out = json.loads(proc.stdout)
+        self.assertIn("sync credentials", out["error"])
+        self.assertFalse(fake_bridge.STATE["groups"]["11"]["stream"]["active"])
+
 
 if __name__ == "__main__":
     unittest.main()

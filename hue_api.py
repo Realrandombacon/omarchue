@@ -33,6 +33,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# Vendored hue-entertainment DTLS modules (Apache-2.0, see vendor/).
+_VENDOR_DIR = str(Path(__file__).resolve().parent / "vendor")
+if _VENDOR_DIR not in sys.path:
+    sys.path.insert(0, _VENDOR_DIR)
+
 EX_OK = 0
 EX_NETWORK = 1
 EX_UNPAIRED = 2
@@ -832,6 +837,220 @@ def cmd_sync_stop(args):
     sys.exit(EX_OK)
 
 
+def cmd_sync_pair(_args):
+    """Pair a dedicated entertainment-streaming key: the DTLS identity is a
+    (username, clientkey) pair the bridge only hands out during a link-button
+    pairing, so this creates a separate credential set from the main one.
+    Streamed JSON lines, same shape as `pair`."""
+    creds = load_creds()
+    if TEST_BASE_URL:
+        merged = dict(creds)
+        merged["syncUsername"] = "TESTSYNCUSERNAME1234567890AB"
+        merged["syncClientkey"] = "00" * 16
+        save_creds(merged)
+        emit({"ok": True, "event": "paired"})
+        sys.exit(EX_OK)
+
+    emit({"event": "discovering"})
+    deadline = time.monotonic() + PAIR_SECONDS
+    body = {"devicetype": "omarchue#sync", "generateclientkey": True}
+    sync_username = None
+    clientkey = None
+    while time.monotonic() < deadline:
+        remaining = int(deadline - time.monotonic())
+        emit({"event": "press-button", "secondsLeft": max(0, remaining)})
+        url = "https://{}/api".format(creds["bridgeId"].lower())
+        with _BridgeResolver(creds["bridgeId"], creds["bridgeIp"]):
+            status, payload = _http("POST", url, body, timeout=5,
+                                    ctx=_tls_context())
+        if isinstance(payload, list):
+            for entry in payload:
+                if isinstance(entry, dict) and "success" in entry:
+                    success = entry["success"] or {}
+                    sync_username = success.get("username")
+                    clientkey = success.get("clientkey")
+                    break
+                if isinstance(entry, dict) and entry.get("error", {}).get("type") == 101:
+                    pass  # link button not pressed yet
+        if sync_username and _USERNAME_RE.fullmatch(sync_username) \
+                and clientkey and re.fullmatch(r"[0-9a-fA-F]{32}", clientkey):
+            break
+        time.sleep(PAIR_RETRY_SECS)
+    if not sync_username or not clientkey:
+        fail(EX_UNPAIRED, "link button was not pressed in time")
+
+    creds["syncUsername"] = sync_username
+    creds["syncClientkey"] = clientkey.lower()
+    save_creds(creds)
+    emit({"event": "paired"})
+    sys.exit(EX_OK)
+
+
+# ------------------------------------------------------- sync streaming ---
+
+SYNC_W = 64
+SYNC_H = 36
+SYNC_COLS = 5
+SYNC_ROWS = 3
+
+
+def _sample_cell(frame, x, y):
+    """Average RGB of the 5x3 grid cell the normalized area position
+    (x, y in -1..1, y up) falls in. Frame is SYNC_W x SYNC_H rgb24."""
+    col = max(0, min(SYNC_COLS - 1, int((x + 1.0) / 2 * SYNC_COLS)))
+    row = max(0, min(SYNC_ROWS - 1, int((1.0 - (y + 1.0) / 2) * SYNC_ROWS)))
+    x0 = col * SYNC_W // SYNC_COLS
+    x1 = (col + 1) * SYNC_W // SYNC_COLS
+    y0 = row * SYNC_H // SYNC_ROWS
+    y1 = (row + 1) * SYNC_H // SYNC_ROWS
+    r = g = b = n = 0
+    for py in range(y0, y1):
+        base = (py * SYNC_W + x0) * 3
+        for px in range(x0, x1):
+            r += frame[base]; g += frame[base + 1]; b += frame[base + 2]
+            base += 3
+            n += 1
+    return r // n, g // n, b // n
+
+
+def sample_channels(frame, channels, intensity):
+    """Frame (rgb24) + area channel positions -> 16-bit LightColorCommands."""
+    from hue_entertainment.models import LightColorCommand
+    factor = max(0.0, min(1.0, intensity))
+    out = []
+    for cid, pos in channels.items():
+        r, g, b = _sample_cell(frame, pos[0], pos[1])
+        out.append(LightColorCommand(
+            channel_id=int(cid),
+            red=min(65535, int(r * 257 * factor)),
+            green=min(65535, int(g * 257 * factor)),
+            blue=min(65535, int(b * 257 * factor))))
+    return out
+
+
+def _spawn_capture(output):
+    """wf-recorder -> raw rgb24 frames on stdout, downscaled in one process
+    via wf-recorder's own ffmpeg filter passthrough."""
+    cmd = ["wf-recorder", "--output", output, "--framerate", "30",
+           "--codec", "rawvideo", "--pixel-format", "rgb24",
+           "--file", "-",
+           "--filter", "scale={}:{}".format(SYNC_W, SYNC_H)]
+    try:
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        fail(EX_USAGE, "wf-recorder is not installed (pacman -S wf-recorder)")
+
+
+def cmd_sync_stream(args):
+    """Long-running screen sync: activate the area's stream, read downscaled
+    screen frames from the capture pipeline, map channel positions to grid
+    cells and push HueStream frames over DTLS at capture rate. Cleans up on
+    exit: stream deactivated, snapshot restored."""
+    creds = load_creds()
+    if not creds.get("syncUsername") or not creds.get("syncClientkey"):
+        fail(EX_UNPAIRED, "no sync credentials — pair Hue Sync first")
+    try:
+        if str(Path(__file__).resolve().parent / "vendor") not in sys.path:
+            sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor"))
+        from hue_entertainment.dtls import HueDtlsStreamer
+    except ImportError as e:
+        fail(EX_USAGE, "streaming needs the vendored DTLS modules and "
+                       "python-cryptography ({})".format(e))
+
+    if not args.id:
+        fail(EX_USAGE, "sync-stream needs a group id")
+    data = v2_data(*v2_request("GET", "/resource/entertainment_configuration"))
+    area = None
+    for a in data or []:
+        if isinstance(a, dict) and str(a.get("id_v1", "")).rsplit("/", 1)[-1] == str(args.id):
+            area = a
+            break
+    if area is None:
+        fail(EX_USAGE, "group {} is not an entertainment area".format(args.id))
+    channels = {}
+    for ch in area.get("channels") or []:
+        pos = ch.get("position") or {}
+        channels[str(ch["channel_id"])] = [
+            float(pos.get("x") or 0.0), float(pos.get("y") or 0.0)]
+    if not channels:
+        fail(EX_BAD_RESPONSE, "area has no channels")
+
+    intensity = max(0.0, min(1.0, float(getattr(args, "intensity", 1.0) or 1.0)))
+    output = args.output or "eDP-2"
+
+    # Snapshot for restore (streaming overrides everything, so the bridge
+    # keeps no history — same as Hue Sync).
+    snap, st = bridge_request("GET", "/groups/{}".format(args.id))
+    v1_error(snap, st)
+    action = (snap.get("action") or {}) if isinstance(snap, dict) else {}
+    restore = {}
+    for key in ("on", "bri"):
+        if action.get(key) is not None:
+            restore[key] = action[key]
+    for key in ("xy", "ct", "hue", "sat"):
+        if action.get(key) is not None:
+            restore[key] = action[key]
+
+    import signal as _signal
+    stopping = {"now": False}
+    _signal.signal(_signal.SIGTERM, lambda *_: stopping.update(now=True))
+
+    proc = None
+    streamer = HueDtlsStreamer()
+    try:
+        v1_error(*bridge_request("PUT", "/groups/{}".format(args.id),
+                                 {"stream": {"active": True}}))
+        # Handshake before the capture starts: nothing must hold the frame
+        # pipe open while the handshake blocks on the bridge.
+        streamer.connect(creds["bridgeIp"], creds["syncUsername"],
+                         creds["syncClientkey"], area["id"])
+        proc, _geom = _spawn_capture(output)
+        emit({"event": "capturing", "output": output, "channels": len(channels)})
+        frame = bytes(SYNC_W * SYNC_H * 3)
+        got_first = False
+        while not stopping["now"]:
+            chunk = proc.stdout.read(SYNC_W * SYNC_H * 3)
+            if chunk is None:
+                continue
+            frame += chunk
+            if len(frame) < SYNC_W * SYNC_H * 3:
+                if proc.poll() is not None:
+                    break  # capture died — clean up below
+                continue
+            frame = frame[-(SYNC_W * SYNC_H * 3):]
+            commands = sample_channels(frame, channels, intensity)
+            streamer.send_colors(commands)
+            if not got_first:
+                got_first = True
+                emit({"event": "streaming", "area": area["id"],
+                      "fps_hint": 30})
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        try:
+            streamer.disconnect()
+        except Exception:
+            pass
+        try:
+            v1_error(*bridge_request("PUT", "/groups/{}".format(args.id),
+                                     {"stream": {"active": False}}))
+        except SystemExit:
+            pass  # bridge may be gone; the 10 s inactivity cutoff is the backstop
+        if restore:
+            try:
+                v1_error(*bridge_request(
+                    "PUT", "/groups/{}/action".format(args.id), restore))
+            except SystemExit:
+                pass
+    emit({"event": "stopped"})
+    sys.exit(EX_OK)
+
+
 def cmd_unpair(_args):
     try:
         STATE_PATH.unlink()
@@ -867,6 +1086,11 @@ def main():
     p_v2recall.add_argument("--speed")
     p_v2recall.add_argument("--body")
     sub.add_parser("sync-areas")
+    sub.add_parser("sync-pair")
+    p_syncstream = sub.add_parser("sync-stream")
+    p_syncstream.add_argument("id")
+    p_syncstream.add_argument("--output", default="eDP-2")
+    p_syncstream.add_argument("--intensity", default=1.0)
     p_syncstop = sub.add_parser("sync-stop")
     p_syncstop.add_argument("id")
     sub.add_parser("unpair")
@@ -883,6 +1107,8 @@ def main():
         "v2-scenes": cmd_v2_scenes,
         "v2-recall": cmd_v2_recall,
         "sync-areas": cmd_sync_areas,
+        "sync-pair": cmd_sync_pair,
+        "sync-stream": cmd_sync_stream,
         "sync-stop": cmd_sync_stop,
         "unpair": cmd_unpair,
     }
