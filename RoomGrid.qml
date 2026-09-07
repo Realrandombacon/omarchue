@@ -2,7 +2,7 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// Home level of the panel: a full-width "Tout" tile (global on/off), then
+// Home level of the panel: a full-width all-lights tile (global on/off), then
 // the 2-column grid of room tiles, Android Hue app style.
 Column {
   id: root
@@ -20,7 +20,7 @@ Column {
     return false
   }
 
-  // "Tout" — one tap kills or lights the whole house.
+  // All-lights tile — one tap kills or lights the whole house.
   Rectangle {
     width: parent.width
     height: Style.space(44)
@@ -43,7 +43,7 @@ Column {
       anchors.left: parent.left
       anchors.leftMargin: Style.space(46)
       anchors.verticalCenter: parent.verticalCenter
-      text: root.anyOn() ? "Tout éteindre" : "Tout allumer"
+      text: root.anyOn() ? "All off" : "All on"
       color: Color.popups.text
       font.family: Style.font.family
       font.pixelSize: Style.font.body

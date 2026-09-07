@@ -5,7 +5,7 @@ import qs.Commons
 import qs.Ui
 
 // Omarchue control panel — two-level Android-app navigation: a home grid
-// of room tiles (plus a global "Tout" on/off tile), then one room's detail
+// of room tiles (plus a global all-lights on/off tile), then one room's detail
 // view with scene chips and per-light color controls. The service injects
 // all state; the panel is a pure view.
 Item {

@@ -157,7 +157,7 @@ Column {
   HuePanelRow {
     width: parent.width
     visible: root.service && root.service.clientKeyReady
-    label: "Intensité"
+    label: "Intensity"
     hint: "How strongly the lights follow the screen. Applies when the next sync starts."
     detail: Math.round((root.service ? root.service.syncIntensity : 0.8) * 100) + " %"
     minimum: 10
