@@ -934,12 +934,17 @@ def _spawn_capture(output):
     """wf-recorder -> raw rgb24 frames through a FIFO. wf-recorder 0.6 +
     ffmpeg 9 cannot stream to stdout ('-f -' produces nothing) and prompts
     without -y; a FIFO is just a file to it and blocks the writer until we
-    open the reader side. Verified empirically: 29.5 fps at 64x36 rgb24."""
+    open the reader side. Verified empirically: 29.5 fps at 64x36 rgb24.
+    The reader opens O_NONBLOCK: if the capture dies before opening its
+    side (bad --output name, missing codec...), a blocking open would hang
+    the helper forever with the UI stuck in 'starting'."""
     fifo = "/tmp/omarchue-sync-{}.fifo".format(os.getpid())
-    try:
-        os.unlink(fifo)
-    except FileNotFoundError:
-        pass
+    errlog = fifo + ".err"
+    for path in (fifo, errlog):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
     os.mkfifo(fifo)
     cmd = ["wf-recorder", "-y", "--output", output, "--framerate", "30",
            "--codec", "rawvideo", "--muxer", "rawvideo",
@@ -947,12 +952,17 @@ def _spawn_capture(output):
            "--filter", "scale={}:{},format=rgb24".format(SYNC_W, SYNC_H),
            "--no-damage"]
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
+        with open(errlog, "wb") as errf:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=errf)
     except FileNotFoundError:
-        os.unlink(fifo)
+        for path in (fifo, errlog):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
         fail(EX_USAGE, "wf-recorder is not installed (pacman -S wf-recorder)")
-    return proc, fifo
+    return proc, fifo, errlog
 
 
 def cmd_sync_stream(args):
@@ -990,7 +1000,9 @@ def cmd_sync_stream(args):
         fail(EX_BAD_RESPONSE, "area has no channels")
 
     intensity = max(0.0, min(1.0, float(getattr(args, "intensity", 1.0) or 1.0)))
-    output = args.output or "eDP-2"
+    output = args.output
+    if not output:
+        fail(EX_USAGE, "sync-stream needs --output (a real monitor name)")
 
     # Snapshot for restore (streaming overrides everything, so the bridge
     # keeps no history — same as Hue Sync).
@@ -1020,14 +1032,33 @@ def cmd_sync_stream(args):
         # pipe open while the handshake blocks on the bridge.
         streamer.connect(creds["bridgeIp"], creds["syncUsername"],
                          creds["syncClientkey"], area["id"])
-        proc, fifo = _spawn_capture(output)
-        # Opening the reader side unblocks wf-recorder's writer open().
-        frames = open(fifo, "rb")
+        proc, fifo, errlog = _spawn_capture(output)
+        # A bad --output name (or any instant capture failure) used to hang
+        # the helper forever: the blocking open() below waits for a writer
+        # that is already dead. Give wf-recorder a moment to die, and open
+        # the reader non-blocking so EOF arrives instead of an eternal wait.
+        deadline = time.monotonic() + 2.0
+        while proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if proc.poll() is not None:
+            with open(errlog, "rb") as errf:
+                err = errf.read().decode("utf-8", "replace").strip()
+            fail(EX_USAGE, "capture failed on output '{}': {}".format(
+                output, err.splitlines()[-1] if err else
+                "wf-recorder exited with code {}".format(proc.returncode)))
+        frames = open(os.open(fifo, os.O_RDONLY | os.O_NONBLOCK), "rb")
         emit({"event": "capturing", "output": output, "channels": len(channels)})
         got_first = False
         frame_size = SYNC_W * SYNC_H * 3
         while not stopping["now"]:
+            # Non-blocking fd: None is EAGAIN (writer not up yet, or between
+            # frames), b"" is a real EOF (writer closed / died).
             frame = frames.read(frame_size)
+            if frame is None:
+                if proc.poll() is not None:
+                    break  # capture died before producing any frame
+                time.sleep(0.005)
+                continue
             if not frame or len(frame) < frame_size:
                 break  # capture ended (writer closed / died)
             commands = sample_channels(frame, channels, intensity)
@@ -1049,10 +1080,11 @@ def cmd_sync_stream(args):
             except subprocess.TimeoutExpired:
                 proc.kill()
         if fifo:
-            try:
-                os.unlink(fifo)
-            except OSError:
-                pass
+            for path in (fifo, errlog):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
         try:
             streamer.disconnect()
         except Exception:

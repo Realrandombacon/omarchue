@@ -440,12 +440,13 @@ Item {
   property string syncActiveId: ""      // v1 group id currently streaming
   property string syncStatus: "idle"    // idle | starting | streaming
   property bool clientKeyReady: false   // syncUsername/syncClientkey saved?
-  property string syncOutput: "eDP-2"
+  property string syncOutput: ""        // first real monitor once detected
   property real syncIntensity: 0.8
   property var outputs: []              // monitor names for the picker
   property string syncPairEvent: ""     // "" | discovering | press-button | paired
   property int syncPairSecondsLeft: 0
   property string _syncStderr: ""
+  property string _pendingSyncId: ""    // zone switch requested mid-stream
 
   Process {
     id: syncAreasProc
@@ -530,11 +531,28 @@ Item {
     stderr: StdioCollector {
       onStreamFinished: root._syncStderr = String(text).trim()
     }
-    onExited: function(exitCode) { root.handleSyncExit(exitCode) }
+    onExited: function(exitCode) {
+      root.handleSyncExit(exitCode)
+      if (root._pendingSyncId !== "") {
+        var id = root._pendingSyncId
+        root._pendingSyncId = ""
+        root.startSync(id)
+      }
+    }
   }
 
   function startSync(v1Id) {
-    if (!isPaired || syncProc.running) return
+    if (!isPaired || syncStatus === "starting") return
+    // Already streaming another zone: stop it first, then relaunch on exit
+    // (a second sync-stream would fight the first over the same area).
+    if (syncProc.running) {
+      if (syncActiveId === v1Id) return
+      _pendingSyncId = v1Id
+      stopSync()
+      return
+    }
+    if (syncOutput === "" && outputs.length > 0) syncOutput = outputs[0]
+    if (syncOutput === "") return  // no monitor detected yet
     syncActiveId = v1Id
     syncStatus = "starting"
     _syncStderr = ""
@@ -588,7 +606,14 @@ Item {
           var names = []
           for (var i = 0; i < ms.length; i++)
             if (ms[i] && ms[i].name) names.push(String(ms[i].name))
-          if (names.length > 0) outputs = names
+          if (names.length > 0) {
+            outputs = names
+            // The picker default must be a monitor that actually exists:
+            // a stale or wrong name makes wf-recorder die instantly and
+            // used to wedge the whole sync state machine.
+            if (names.indexOf(root.syncOutput) === -1)
+              root.syncOutput = names[0]
+          }
         } catch (e) {
           console.warn("omarchue: hyprctl monitors output unreadable:", e)
         }
