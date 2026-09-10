@@ -54,7 +54,12 @@ Item {
   function helperCmd(args) {
     var dir = (manifest && manifest.__sourceDir)
               ? String(manifest.__sourceDir) : ""
-    return ["python3", dir + "/hue_api.py"].concat(args)
+    // PYTHONDONTWRITEBYTECODE: python must not drop __pycache__ inside the
+    // deployed plugin dir — the shell's inotify watcher treats every write
+    // as a plugin change and reloads it (16 reloads in one second while a
+    // sync was starting froze the whole panel).
+    return ["env", "PYTHONDONTWRITEBYTECODE=1", "python3", dir + "/hue_api.py"]
+           .concat(args)
   }
 
   // The shell injects `manifest` AFTER createObject, so Component.onCompleted

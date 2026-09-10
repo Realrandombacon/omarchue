@@ -19,6 +19,11 @@ FILES=(manifest.json HueService.qml Panel.qml PairingView.qml RoomGrid.qml
 
 # Vendored hue-entertainment DTLS transport (Apache-2.0, see vendor/ LICENSE).
 mkdir -p "$DEST/vendor/hue_entertainment"
+# Stale python bytecode from a previous run: re-copied sources make the
+# .pyc stale, and the next helper run would rewrite it INSIDE the deployed
+# dir, tripping the shell's plugin watcher (reload storm). The service
+# spawns the helper with PYTHONDONTWRITEBYTECODE=1, so this only cleans up.
+rm -rf "$DEST/vendor/hue_entertainment/__pycache__"
 for f in __init__.py constants.py models.py dtls.py LICENSE; do
   [[ -f "$HERE/vendor/hue_entertainment/$f" ]] && \
     cp -f "$HERE/vendor/hue_entertainment/$f" "$DEST/vendor/hue_entertainment/"
